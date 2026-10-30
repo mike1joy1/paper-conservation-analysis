@@ -1,0 +1,15 @@
+pyproject.toml
+src/paperdiff/__init__.py
+src/paperdiff/align.py
+src/paperdiff/colour.py
+src/paperdiff/loading.py
+src/paperdiff/masks.py
+src/paperdiff/sample_data.py
+src/paperdiff/stats.py
+src/paperdiff.egg-info/PKG-INFO
+src/paperdiff.egg-info/SOURCES.txt
+src/paperdiff.egg-info/dependency_links.txt
+src/paperdiff.egg-info/top_level.txt
+tests/test_align.py
+tests/test_stage1.py
+tests/test_stage3.py

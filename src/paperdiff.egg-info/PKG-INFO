@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: paperdiff
+Version: 0.1.0
+Summary: Paper conservation analysis tools
+Requires-Python: >=3.10
