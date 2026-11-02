@@ -1,3 +1,11 @@
+"""Core measurement code for the paper conservation analysis workflow.
+
+This file intentionally keeps the logic simple and explicit. The calculation steps
+are: convert to Lab colour space, compute the per-pixel visual difference, mask
+paper/ink regions from the reference image, and then summarise the change in a
+way that is easy to inspect and verify.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -46,6 +54,12 @@ def _smooth_rgb(image: np.ndarray, sigma: float = DEFAULT_GAUSSIAN_SIGMA) -> np.
 
 
 def compute_deltas(before: np.ndarray, after: np.ndarray, sigma: float = DEFAULT_GAUSSIAN_SIGMA) -> dict[str, np.ndarray]:
+    """Compute the Lab-space colour difference between two images.
+
+    The purpose of this function is to make the measurement explicit and readable.
+    We calculate the overall ΔE00 metric and also the directional Lab components
+    that tell us whether the change is brighter/darker or more yellow/blue.
+    """
     before_rgb = _smooth_rgb(before, sigma)
     after_rgb = _smooth_rgb(after, sigma)
 
@@ -78,14 +92,20 @@ def _threshold_for_mask(luma: np.ndarray, threshold: float | None = None, use_ot
 
 
 def compute_ink_mask(image: np.ndarray, threshold: float | None = None, sigma_ink: float = INK_SIGMA, use_otsu: bool = False) -> np.ndarray:
+    """Return the mask covering the ink-like pixels in the reference image.
+
+    This is the key segmentation step. The code smooths the luminance image, picks
+    a threshold and then removes isolated noise so that the mask reflects actual ink
+    regions rather than image speckle.
+    """
     rgb = _as_rgb_float(image)
     gray = rgb2gray(rgb)
     luma = ndimage.gaussian_filter(gray, sigma=sigma_ink, mode="reflect")
     cutoff = _threshold_for_mask(luma, threshold=threshold if threshold is not None else INK_THRESHOLD_OVERRIDE, use_otsu=use_otsu)
     mask = luma < cutoff
     mask = ndimage.binary_erosion(mask, iterations=MASK_ERODE_PX, border_value=0)
-    mask = remove_small_objects(mask.astype(bool), min_size=MIN_INK_SPECK_PX)
-    mask = remove_small_holes(mask.astype(bool), area_threshold=MIN_INK_SPECK_PX)
+    mask = remove_small_objects(mask.astype(bool), max_size=MIN_INK_SPECK_PX)
+    mask = remove_small_holes(mask.astype(bool), max_size=MIN_INK_SPECK_PX)
     return mask.astype(bool)
 
 
@@ -135,6 +155,12 @@ def _verdict_for_region(median_dE: float, baseline_p95: float) -> str:
 
 
 def evaluate_reference_pair(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, sigma: float = DEFAULT_GAUSSIAN_SIGMA) -> dict[str, dict[str, Any]]:
+    """Measure B1 vs B2 and B1 vs A using the same paper/ink mask.
+
+    This function is the direct research comparison: it keeps the reference image
+    fixed, compares both baseline and test images to it, and reports the summary
+    metrics for the paper and ink regions separately.
+    """
     b1_rgb = _as_rgb_float(b1)
     b2_rgb = _as_rgb_float(b2)
     a_rgb = _as_rgb_float(a)

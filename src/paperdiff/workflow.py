@@ -1,13 +1,22 @@
+"""Simple analysis workflow for already-aligned paper images.
+
+This module is intentionally small and explicit. The research assumption is that
+B1, B2 and A have already been aligned and cropped before they reach this app.
+The code therefore focuses only on measuring the visual difference between the
+reference image and the comparison images.
+"""
+
 from __future__ import annotations
 
 import numpy as np
 
 from .analysis import compute_deltas, compute_ink_mask
 
-__all__ = ["evaluate_reference_pair", "register_image_to_reference", "describe_region_change"]
+__all__ = ["evaluate_reference_pair", "describe_region_change"]
 
 
 def _as_rgb(image: np.ndarray) -> np.ndarray:
+    """Convert any image-like input to a float RGB array in the 0..1 range."""
     array = np.asarray(image, dtype=np.float32)
     if array.ndim == 2:
         array = np.repeat(array[..., None], 3, axis=-1)
@@ -16,16 +25,10 @@ def _as_rgb(image: np.ndarray) -> np.ndarray:
     return array.astype(np.float32)
 
 
-def register_image_to_reference(reference: np.ndarray, moving: np.ndarray) -> tuple[np.ndarray, dict[str, object]]:
-    """Compatibility shim for already-aligned images. The app assumes alignment has already been done externally."""
-    ref = _as_rgb(reference)
-    mov = _as_rgb(moving)
-    if ref.shape != mov.shape:
-        raise ValueError(f"Reference and moving images must have matching shapes: {ref.shape} != {mov.shape}")
-    return mov.copy(), {"transform": np.eye(3, dtype=np.float32), "transform_type": "identity", "score": 1.0}
-
-
 def _summarize_metric_map(values: np.ndarray) -> dict[str, float]:
+    """Return the raw statistical summary for a region. This is kept visible so
+    the output remains verifiable and audit-friendly.
+    """
     values = np.asarray(values, dtype=np.float32)
     if values.size == 0:
         return {"mean": 0.0, "std": 0.0, "max": 0.0, "median": 0.0, "n_pixels": 0.0}
@@ -39,6 +42,12 @@ def _summarize_metric_map(values: np.ndarray) -> dict[str, float]:
 
 
 def describe_region_change(metrics: dict[str, float], region_name: str = "region") -> str:
+    """Translate the numerical metrics into plain-language conservation notes.
+
+    The app reports both the science metric (ΔE00) and the underlying Lab-direction
+    components: lightness (L*) and yellow-blue shift (b*). This makes the result
+    understandable to a new user without requiring them to decode the raw arrays.
+    """
     mean_delta = float(metrics.get("mean", 0.0))
     dL = float(metrics.get("dL_median", metrics.get("dL_mean", 0.0)))
     db = float(metrics.get("db_median", metrics.get("db_mean", 0.0)))
@@ -63,7 +72,14 @@ def describe_region_change(metrics: dict[str, float], region_name: str = "region
 
 
 def evaluate_reference_pair(b1: np.ndarray, b2: np.ndarray, a: np.ndarray) -> dict[str, dict[str, object]]:
-    """Evaluate the difference between B1 and each comparison image. Images are expected to be already aligned and cropped."""
+    """Compare B1 with B2 and A using the already-aligned input images.
+
+    The workflow is intentionally simple:
+    1. Build a paper/ink mask from B1.
+    2. Compute per-pixel colour deltas between B1 and each comparison image.
+    3. Summarise the change in the paper and ink regions.
+    4. Return the raw numbers and a simple score for each comparison.
+    """
     ref = _as_rgb(b1)
     base_img = _as_rgb(b2)
     test_img = _as_rgb(a)
@@ -71,11 +87,16 @@ def evaluate_reference_pair(b1: np.ndarray, b2: np.ndarray, a: np.ndarray) -> di
     if ref.shape != base_img.shape or ref.shape != test_img.shape:
         raise ValueError("B1, B2, and A must all have matching widths, heights, and channels.")
 
+    # Build the mask once from the reference image and reuse it for both comparisons.
     ink_mask = compute_ink_mask(ref)
     paper_mask = ~ink_mask
+
+    # B1 vs B2 is the baseline reference noise; B1 vs A is the treatment change.
     base_diff = compute_deltas(ref, base_img)
     test_diff = compute_deltas(ref, test_img)
 
+    # Keep the raw numbers visible, but also attach the Lab-direction metrics used in
+    # the human-readable report so the meaning of the result is clear.
     base_paper = _summarize_metric_map(base_diff["dE00"][paper_mask])
     base_paper["dL_median"] = float(np.median(base_diff["dL"][paper_mask])) if np.any(paper_mask) else 0.0
     base_paper["db_median"] = float(np.median(base_diff["db"][paper_mask])) if np.any(paper_mask) else 0.0

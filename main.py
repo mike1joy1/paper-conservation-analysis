@@ -1,9 +1,12 @@
+"""Simple desktop app for measuring change between already-aligned images.
+"""
 
 import sys
 from pathlib import Path
 
 import numpy as np
 
+# Add the source tree to the import path so the app can import the package.
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
@@ -30,11 +33,15 @@ from paperdiff.workflow import describe_region_change, evaluate_reference_pair
 
 
 class MainWindow(QMainWindow):
+    """The main window for loading images and viewing the change report."""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Paper Conservation Analysis")
         self.resize(1200, 800)
 
+        # The app assumes the alignment step is already complete before the images
+        # are loaded here.
         self.b1_path = None
         self.b2_path = None
         self.a_path = None
@@ -43,6 +50,7 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("font-size: 15px; margin: 8px;")
 
+        # Buttons for the three image inputs and the analysis action.
         self.load_b1_button = QPushButton("Load B1")
         self.load_b2_button = QPushButton("Load B2")
         self.load_a_button = QPushButton("Load A")
@@ -53,6 +61,7 @@ class MainWindow(QMainWindow):
         self.load_a_button.clicked.connect(self.load_a)
         self.analyze_button.clicked.connect(self.analyze_images)
 
+        # Small preview panels to help the user confirm the correct images are loaded.
         self.b1_preview = QLabel("B1")
         self.b1_preview.setAlignment(Qt.AlignCenter)
         self.b1_preview.setMinimumSize(260, 210)
@@ -94,10 +103,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
     def _set_preview_from_path(self, label: QLabel, path: str | Path):
+        """Load an image and display it in the preview panel."""
         image = load_image(path)
         self._set_preview_from_array(label, image)
 
     def _set_preview_from_array(self, label: QLabel, image):
+        """Convert a NumPy image to a Qt image so it can be shown on screen."""
         array = np.asarray(image, dtype=np.float32)
         if array.ndim == 2:
             array = np.repeat(array[..., None], 3, axis=-1)
@@ -112,6 +123,7 @@ class MainWindow(QMainWindow):
         label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def load_b1(self):
+        """Prompt the user for B1 and show it in the preview."""
         path, _ = QFileDialog.getOpenFileName(self, "Select B1 image", "", "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)")
         if path:
             self.b1_path = path
@@ -119,6 +131,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"B1 loaded: {path}")
 
     def load_b2(self):
+        """Prompt the user for B2 and show it in the preview."""
         path, _ = QFileDialog.getOpenFileName(self, "Select B2 image", "", "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)")
         if path:
             self.b2_path = path
@@ -126,6 +139,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"B2 loaded: {path}")
 
     def load_a(self):
+        """Prompt the user for A and show it in the preview."""
         path, _ = QFileDialog.getOpenFileName(self, "Select A image", "", "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)")
         if path:
             self.a_path = path
@@ -133,6 +147,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"A loaded: {path}")
 
     def analyze_images(self):
+        """Load the three images, run the research comparison, and write a report."""
         if self.b1_path is None or self.b2_path is None or self.a_path is None:
             QMessageBox.warning(self, "Missing input", "Load B1, B2, and A before running the analysis.")
             return
@@ -145,6 +160,8 @@ class MainWindow(QMainWindow):
             base = results["base"]
             test = results["test"]
 
+            # Build a plain-language summary that names the actual measured change:
+            # overall colour change (ΔE00), brightness shift (L*) and yellow/blue shift (b*).
             summary_lines = [
                 "Base comparison: B1 vs B2",
                 f"Mean overall difference: {base['score']:.3f} ΔE00",
@@ -180,6 +197,8 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # This is the entry point for the desktop app. It starts the GUI and then exits
+    # when the window is closed.
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
