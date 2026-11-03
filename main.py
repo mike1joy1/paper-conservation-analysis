@@ -17,8 +17,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -46,14 +46,191 @@ from paperdiff.stats import verdict_for_region
 from paperdiff.workflow import describe_region_change, evaluate_reference_pair
 
 
-class ClickableLabel(QLabel):
-    """A QLabel that emits a click signal so the alignment viewer can cycle images."""
+class ZoomableLabel(QLabel):
+    """A QLabel that keeps a base pixmap and allows zooming via the mouse wheel."""
 
     clicked = Signal()
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self._base_pixmap = QPixmap()
+        self._zoom_factor = 1.0
+        self._auto_fit_zoom = True
+        self._fixed_viewport = QSize(320, 240)
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self.setMinimumSize(120, 80)
+
+    def sizeHint(self):
+        return self._fixed_viewport if self._fixed_viewport.isValid() else QSize(320, 240)
+
+    def minimumSizeHint(self):
+        return QSize(120, 80)
+
+    def _clamp_pan(self, viewport: QSize, scaled_width: int, scaled_height: int, pan_x: float | None = None, pan_y: float | None = None):
+        if pan_x is None:
+            pan_x = self._pan_x
+        if pan_y is None:
+            pan_y = self._pan_y
+
+        if scaled_width <= viewport.width():
+            pan_x = (viewport.width() - scaled_width) / 2.0
+        else:
+            pan_x = min(0.0, max(viewport.width() - scaled_width, pan_x))
+
+        if scaled_height <= viewport.height():
+            pan_y = (viewport.height() - scaled_height) / 2.0
+        else:
+            pan_y = min(0.0, max(viewport.height() - scaled_height, pan_y))
+
+        return pan_x, pan_y
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fixed_viewport = self.size()
+        if self._base_pixmap is not None and not self._base_pixmap.isNull():
+            if self._auto_fit_zoom:
+                self._apply_fit_zoom()
+            self._refresh_zoomed_pixmap()
+
+    def setPixmap(self, pixmap, preserve_zoom: bool = False):
+        self._base_pixmap = pixmap if pixmap is not None else QPixmap()
+        if preserve_zoom:
+            self._auto_fit_zoom = False
+            self._refresh_zoomed_pixmap()
+            return
+
+        self._auto_fit_zoom = True
+        self._apply_fit_zoom()
+        self._refresh_zoomed_pixmap()
+
+    def setFixedViewport(self, width: int, height: int):
+        self._fixed_viewport = QSize(width, height)
+        self._apply_fit_zoom()
+        self._refresh_zoomed_pixmap()
+
+    def _fit_zoom_for_viewport(self, viewport: QSize | None = None) -> float:
+        """Return the maximum zoom-out value that keeps the entire image inside the current viewport."""
+        if self._base_pixmap is None or self._base_pixmap.isNull():
+            return 1.0
+
+        if viewport is None:
+            viewport = self._fixed_viewport if self._fixed_viewport.width() > 0 and self._fixed_viewport.height() > 0 else self.size()
+        if viewport.width() <= 0 or viewport.height() <= 0:
+            return 1.0
+
+        source_size = self._base_pixmap.size()
+        if source_size.width() <= 0 or source_size.height() <= 0:
+            return 1.0
+
+        fit_factor = min(viewport.width() / source_size.width(), viewport.height() / source_size.height())
+        return max(0.05, min(12.0, fit_factor))
+
+    def _apply_fit_zoom(self):
+        """Default to the maximum zoom-out state so the whole image stays visible."""
+        fit_zoom = self._fit_zoom_for_viewport()
+        self._zoom_factor = max(0.05, min(12.0, fit_zoom))
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+
+    def _render_centered_pixmap(self, source_pixmap: QPixmap, viewport: QSize) -> QPixmap:
+        """Paint the image inside the viewport and keep the current pan/zoom anchored."""
+        canvas = QPixmap(viewport)
+        canvas.fill(self.palette().color(self.backgroundRole()))
+
+        if source_pixmap.isNull() or viewport.width() <= 0 or viewport.height() <= 0:
+            return canvas
+
+        scaled = source_pixmap.scaled(
+            QSize(max(1, int(source_pixmap.width() * self._zoom_factor)), max(1, int(source_pixmap.height() * self._zoom_factor))),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        if scaled.width() <= 0 or scaled.height() <= 0:
+            return canvas
+
+        self._pan_x, self._pan_y = self._clamp_pan(viewport, scaled.width(), scaled.height())
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(int(round(self._pan_x)), int(round(self._pan_y)), scaled)
+        painter.end()
+        return canvas
+
+    def _refresh_zoomed_pixmap(self):
+        if self._base_pixmap is None or self._base_pixmap.isNull():
+            super().setPixmap(QPixmap())
+            return
+
+        viewport = self._fixed_viewport if self._fixed_viewport.width() > 0 and self._fixed_viewport.height() > 0 else self.size()
+        if viewport.width() <= 0 or viewport.height() <= 0:
+            viewport = self._base_pixmap.size()
+
+        minimum_zoom = self._fit_zoom_for_viewport(viewport)
+        self._zoom_factor = max(minimum_zoom, min(12.0, self._zoom_factor))
+        self._pan_x, self._pan_y = self._clamp_pan(viewport, max(1, int(self._base_pixmap.width() * self._zoom_factor)), max(1, int(self._base_pixmap.height() * self._zoom_factor)))
+        super().setPixmap(self._render_centered_pixmap(self._base_pixmap, viewport))
+
+    def wheelEvent(self, event):
+        if self._base_pixmap is None or self._base_pixmap.isNull():
+            return
+
+        self._auto_fit_zoom = False
+        viewport = self.size()
+        if viewport.width() <= 0 or viewport.height() <= 0:
+            return
+
+        old_zoom = self._zoom_factor
+        delta = event.angleDelta().y()
+        fit_zoom = self._fit_zoom_for_viewport()
+        if delta > 0:
+            new_zoom = min(12.0, max(fit_zoom, old_zoom * 1.15))
+        elif delta < 0:
+            new_zoom = max(fit_zoom, old_zoom * 0.85)
+        else:
+            return
+
+        old_scaled_width = max(1, int(self._base_pixmap.width() * old_zoom))
+        old_scaled_height = max(1, int(self._base_pixmap.height() * old_zoom))
+
+        cursor_x = event.position().x()
+        cursor_y = event.position().y()
+
+        anchor_x = cursor_x - self._pan_x
+        anchor_y = cursor_y - self._pan_y
+        anchor_u = max(0.0, min(1.0, anchor_x / old_scaled_width))
+        anchor_v = max(0.0, min(1.0, anchor_y / old_scaled_height))
+
+        new_scaled_width = max(1, int(self._base_pixmap.width() * new_zoom))
+        new_scaled_height = max(1, int(self._base_pixmap.height() * new_zoom))
+        new_pan_x = cursor_x - (anchor_u * new_scaled_width)
+        new_pan_y = cursor_y - (anchor_v * new_scaled_height)
+
+        self._zoom_factor = new_zoom
+        self._pan_x, self._pan_y = self._clamp_pan(viewport, new_scaled_width, new_scaled_height, new_pan_x, new_pan_y)
+        self._refresh_zoomed_pixmap()
+        event.accept()
 
     def mousePressEvent(self, event):
         self.clicked.emit()
         super().mousePressEvent(event)
+
+    def clear(self):
+        self._base_pixmap = QPixmap()
+        self._zoom_factor = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        super().clear()
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class ClickableLabel(ZoomableLabel):
+    """A zoomable label that emits a click signal so the alignment viewer can cycle images."""
+
+    pass
 
 
 class MainWindow(QMainWindow):
@@ -62,6 +239,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Paper Conservation Analysis")
+        self.setMinimumSize(0, 0)
         self.resize(1200, 800)
 
         # The scientific workflow assumes the images are already aligned and cropped
@@ -97,6 +275,34 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.analysis_options_tab, "4) Analysis options")
         self.tab_widget.addTab(self.results_tab, "5) Results")
 
+        self._refresh_preview_box_sizes()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_preview_box_sizes()
+
+    def _refresh_preview_box_sizes(self):
+        """Keep the small preview cards and the alignment viewer scaled by the current window size, without forcing fixed internal viewport dimensions."""
+        available_width = max(240, self.width() - 180)
+        thumb_width = max(180, min(360, int(available_width / 3)))
+        available_height = max(180, self.height() - 300)
+        thumb_height = max(90, min(int(thumb_width * 0.55), available_height))
+
+        if hasattr(self, "load_preview_labels"):
+            for label in self.load_preview_labels.values():
+                label.setMinimumSize(80, 60)
+
+        if hasattr(self, "alignment_preview"):
+            self.alignment_preview.setMinimumSize(200, 120)
+
+        if hasattr(self, "mask_original_labels"):
+            for label in self.mask_original_labels.values():
+                label.setMinimumSize(80, 60)
+                label.setFixedHeight(thumb_height)
+            for label in self.mask_preview_labels.values():
+                label.setMinimumSize(80, 60)
+                label.setFixedHeight(thumb_height)
+
     def _preview_from_array(self, label: QLabel, image):
         """Convert an image array into a Qt pixmap for display in the app."""
         array = np.asarray(image, dtype=np.float32)
@@ -117,27 +323,74 @@ class MainWindow(QMainWindow):
         h, w, ch = rgb.shape
         qimage = QImage(rgb.data, w, h, w * ch, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimage.copy())
-        label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-    def _display_mask_preview(self, label: QLabel, mask_array, border_mask=None):
-        """Render a black/white mask with red border pixels for the mask edge."""
-        if mask_array is None:
-            label.setText("No mask")
-            label.setPixmap(QPixmap())
+        if isinstance(label, ZoomableLabel):
+            label.setPixmap(pixmap, preserve_zoom=True)
             return
 
-        mask = np.asarray(mask_array, dtype=bool)
-        if border_mask is None:
-            border_mask = mask ^ binary_erosion(mask, iterations=1)
+        viewport = label.size()
+        if viewport.width() <= 0 or viewport.height() <= 0:
+            label.setPixmap(pixmap)
+            return
 
-        h, w = mask.shape
-        rendered = np.zeros((h, w, 3), dtype=np.uint8)
-        rendered[mask] = [255, 255, 255]
-        rendered[border_mask] = [255, 0, 0]
+        fit_pixmap = QPixmap(viewport)
+        fit_pixmap.fill(label.palette().color(label.backgroundRole()))
+        scaled = pixmap.scaled(viewport, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        offset_x = max(0, (viewport.width() - scaled.width()) // 2)
+        offset_y = max(0, (viewport.height() - scaled.height()) // 2)
+        painter = QPainter(fit_pixmap)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(offset_x, offset_y, scaled)
+        painter.end()
+        label.setPixmap(fit_pixmap)
+
+    def _display_mask_preview(self, label: QLabel, mask_array=None, border_mask=None, paper_mask=None, ink_mask=None):
+        """Render the classification as white paper, black ink, and red for pixels in neither mask."""
+        if paper_mask is not None and ink_mask is not None:
+            paper = np.asarray(paper_mask, dtype=bool)
+            ink = np.asarray(ink_mask, dtype=bool)
+            h, w = paper.shape
+            rendered = np.zeros((h, w, 3), dtype=np.uint8)
+            rendered[paper] = [255, 255, 255]
+            rendered[ink] = [0, 0, 0]
+            rendered[~paper & ~ink] = [255, 0, 0]
+        else:
+            if mask_array is None:
+                label.setText("No mask")
+                label.setPixmap(QPixmap())
+                return
+
+            mask = np.asarray(mask_array, dtype=bool)
+            if border_mask is None:
+                border_mask = mask ^ binary_erosion(mask, iterations=1)
+
+            h, w = mask.shape
+            rendered = np.zeros((h, w, 3), dtype=np.uint8)
+            rendered[mask] = [255, 255, 255]
+            rendered[border_mask] = [255, 0, 0]
 
         qimage = QImage(rendered.data, w, h, w * 3, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimage.copy())
-        label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        if isinstance(label, ZoomableLabel):
+            label.setPixmap(pixmap, preserve_zoom=True)
+            return
+
+        viewport = label.size()
+        if viewport.width() <= 0 or viewport.height() <= 0:
+            label.setPixmap(pixmap)
+            return
+
+        fit_pixmap = QPixmap(viewport)
+        fit_pixmap.fill(label.palette().color(label.backgroundRole()))
+        scaled = pixmap.scaled(viewport, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        offset_x = max(0, (viewport.width() - scaled.width()) // 2)
+        offset_y = max(0, (viewport.height() - scaled.height()) // 2)
+        painter = QPainter(fit_pixmap)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(offset_x, offset_y, scaled)
+        painter.end()
+        label.setPixmap(fit_pixmap)
 
     def _set_preview_text(self, label: QLabel, text: str):
         label.setText(text)
@@ -160,7 +413,7 @@ class MainWindow(QMainWindow):
         """Display the current overlay colour on the check-alignment button."""
         if hasattr(self, "overlay_button"):
             self._apply_button_colour(self.overlay_button, self.mask_overlay_colour)
-            self.overlay_button.setText(f"Overlay colour: {self.mask_overlay_colour.name()}")
+            self.overlay_button.setText(f" Mask overlay colour: {self.mask_overlay_colour.name()} ")
 
     def _open_image_for_key(self, key: str):
         """Open a single image and store it in the loaded arrays for the given key."""
@@ -218,7 +471,7 @@ class MainWindow(QMainWindow):
 
             preview_label = QLabel(f"{key}")
             preview_label.setAlignment(Qt.AlignCenter)
-            preview_label.setMinimumSize(240, 180)
+            preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             preview_label.setStyleSheet("border: 1px solid #888; background: #262626;")
             card_layout.addWidget(preview_label)
 
@@ -258,12 +511,18 @@ class MainWindow(QMainWindow):
                 self.alignment_preview.clear()
                 self.alignment_preview.setText("No mask found")
                 return
-            mask = self.ink_mask_arrays.get(key)
-            if mask is None:
+            paper_mask = self.paper_mask_arrays.get(key)
+            ink_mask = self.ink_mask_arrays.get(key)
+            if paper_mask is None or ink_mask is None:
                 self.alignment_preview.clear()
                 self.alignment_preview.setText("No mask found")
                 return
-            self._display_mask_preview(self.alignment_preview, mask, self.mask_border_arrays.get(key))
+            self._display_mask_preview(
+                self.alignment_preview,
+                paper_mask=paper_mask,
+                ink_mask=ink_mask,
+                border_mask=self.mask_border_arrays.get(key),
+            )
             return
 
         array = np.asarray(image, dtype=np.float32)
@@ -296,9 +555,7 @@ class MainWindow(QMainWindow):
         h, w, ch = rgb.shape
         qimage = QImage(rgb.data, w, h, w * ch, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimage.copy())
-        self.alignment_preview.setPixmap(
-            pixmap.scaled(self.alignment_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
+        self.alignment_preview.setPixmap(pixmap, preserve_zoom=True)
 
     def _cycle_alignment_image(self):
         order = ["B1", "B2", "A"]
@@ -310,6 +567,12 @@ class MainWindow(QMainWindow):
     def _update_alignment_buttons(self):
         for key, button in self.alignment_buttons.items():
             button.setChecked(key == self.current_alignment_view)
+
+    def _reset_alignment_zoom(self):
+        if hasattr(self, "alignment_preview") and self.alignment_preview._base_pixmap is not None and not self.alignment_preview._base_pixmap.isNull():
+            self.alignment_preview._auto_fit_zoom = True
+            self.alignment_preview._apply_fit_zoom()
+            self.alignment_preview._refresh_zoomed_pixmap()
 
     def _create_check_alignment_tab(self):
         """Tab 3: visually inspect the alignment by switching the view between B1/B2/A."""
@@ -343,8 +606,8 @@ class MainWindow(QMainWindow):
             view_layout.addWidget(radio)
         layout.addWidget(view_group)
 
-        self.overlay_button = QPushButton(f"Overlay colour: {self.mask_overlay_colour.name()}")
-        self.overlay_button.setFixedWidth(220)
+        self.overlay_button = QPushButton(f"Mask overlay colour: {self.mask_overlay_colour.name()}")
+        self.overlay_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.overlay_button.clicked.connect(self._choose_mask_overlay_colour)
         self._update_overlay_button_style()
         overlay_row = QHBoxLayout()
@@ -362,18 +625,28 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda checked, value=key: self._set_alignment_view(value))
             button_row.addWidget(button)
             self.alignment_buttons[key] = button
-        layout.addLayout(button_row)
 
         self.alignment_preview = ClickableLabel("B1")
         self.alignment_preview.setAlignment(Qt.AlignCenter)
-        self.alignment_preview.setMinimumSize(600, 450)
         self.alignment_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.alignment_preview.setMinimumSize(200, 120)
         self.alignment_preview.setStyleSheet("border: 1px solid #888; background: #262626;")
         self.alignment_preview.clicked.connect(self._cycle_alignment_image)
+
+        self.reset_alignment_zoom_button = QPushButton("Reset zoom")
+        self.reset_alignment_zoom_button.clicked.connect(self._reset_alignment_zoom)
+
+        selector_row = QHBoxLayout()
+        selector_row.setAlignment(Qt.AlignLeft)
+        selector_row.addLayout(button_row)
+        selector_row.addStretch(1)
+        selector_row.addWidget(self.reset_alignment_zoom_button)
+        layout.addLayout(selector_row)
         layout.addWidget(self.alignment_preview)
 
         self._update_alignment_buttons()
         self._refresh_alignment_preview()
+        self._reset_alignment_zoom()
         return page
 
     def _set_alignment_view(self, key: str):
@@ -503,15 +776,20 @@ class MainWindow(QMainWindow):
             adjusted_ink_distance = (1.0 - paper_weight) * ink_distance + paper_weight * max_distance
             ink_mask = adjusted_paper_distance > adjusted_ink_distance
 
-        paper_mask = ~ink_mask
+        original_ink_mask = ink_mask.copy()
+        original_paper_mask = (~original_ink_mask).astype(bool)
         border_pixels = self.mask_border_slider.value()
-        if border_pixels > 0:
-            border_mask = ink_mask ^ binary_erosion(ink_mask, iterations=border_pixels)
-        else:
-            border_mask = np.zeros_like(ink_mask, dtype=bool)
 
-        ink_mask = ink_mask & ~border_mask
-        paper_mask = paper_mask & ~border_mask
+        if border_pixels > 0:
+            paper_mask = binary_erosion(original_paper_mask, iterations=border_pixels)
+            ink_mask = binary_erosion(original_ink_mask, iterations=border_pixels)
+            border_mask = (original_ink_mask ^ binary_erosion(original_ink_mask, iterations=1)) | (
+                original_paper_mask ^ binary_erosion(original_paper_mask, iterations=1)
+            )
+        else:
+            paper_mask = original_paper_mask
+            ink_mask = original_ink_mask
+            border_mask = np.zeros_like(original_ink_mask, dtype=bool)
 
         self.ink_mask_arrays[key] = ink_mask
         self.paper_mask_arrays[key] = paper_mask
@@ -521,8 +799,9 @@ class MainWindow(QMainWindow):
         if self.ink_mask_arrays.get(key) is not None:
             self._display_mask_preview(
                 self.mask_preview_labels[key],
-                self.ink_mask_arrays[key],
-                self.mask_border_arrays.get(key),
+                paper_mask=self.paper_mask_arrays.get(key),
+                ink_mask=self.ink_mask_arrays.get(key),
+                border_mask=self.mask_border_arrays.get(key),
             )
 
         self._display_alignment_image()
@@ -625,12 +904,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.use_mask_checkbox)
 
         settings_group = QGroupBox("Mask settings")
-        settings_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        settings_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         settings_layout = QVBoxLayout(settings_group)
+        settings_layout.setSpacing(6)
+        settings_layout.setContentsMargins(8, 8, 8, 8)
 
         mode_group = QGroupBox("Mask generation")
-        mode_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        mode_group.setMaximumWidth(280)
+        mode_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        mode_group.setMaximumWidth(320)
         mode_layout = QHBoxLayout(mode_group)
         self.mask_mode_group = QButtonGroup(page)
         self.luminance_radio = QRadioButton("Luminance")
@@ -647,6 +928,7 @@ class MainWindow(QMainWindow):
         self.mask_threshold_slider = QSlider(Qt.Horizontal)
         self.mask_threshold_slider.setRange(0, 255)
         self.mask_threshold_slider.setValue(140)
+        self.mask_threshold_slider.setFixedHeight(18)
         self.mask_threshold_label = QLabel("Luminance threshold: 140")
         self.mask_threshold_slider.setEnabled(True)
         self.mask_threshold_slider.valueChanged.connect(
@@ -659,6 +941,7 @@ class MainWindow(QMainWindow):
         self.reference_weight_slider.setRange(0, 100)
         self.reference_weight_slider.setValue(50)
         self.reference_weight_slider.setEnabled(False)
+        self.reference_weight_slider.setFixedHeight(18)
         self.reference_weight_label = QLabel("Reference weight: 0.50")
         self.reference_weight_slider.valueChanged.connect(
             lambda value: self.reference_weight_label.setText(f"Reference weight: {value / 100.0:.2f}")
@@ -669,6 +952,7 @@ class MainWindow(QMainWindow):
         self.mask_border_slider = QSlider(Qt.Horizontal)
         self.mask_border_slider.setRange(0, 20)
         self.mask_border_slider.setValue(2)
+        self.mask_border_slider.setFixedHeight(18)
         self.mask_border_label = QLabel("Mask border: 2 px")
         self.mask_border_slider.valueChanged.connect(
             lambda value: self.mask_border_label.setText(f"Mask border: {value} px")
@@ -687,40 +971,42 @@ class MainWindow(QMainWindow):
         self.mask_border_arrays = {"B1": None, "B2": None, "A": None}
         grid = QGridLayout()
         grid.setAlignment(Qt.AlignTop)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
         for col, key in enumerate(["B1", "B2", "A"]):
             card = QWidget()
             card_layout = QVBoxLayout(card)
 
             original_preview = QLabel(f"Original {key}")
             original_preview.setAlignment(Qt.AlignCenter)
-            original_preview.setMinimumSize(240, 140)
+            original_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             original_preview.setStyleSheet("border: 1px solid #888; background: #262626;")
             card_layout.addWidget(original_preview)
 
             mask_preview = QLabel(f"Mask {key}")
             mask_preview.setAlignment(Qt.AlignCenter)
-            mask_preview.setMinimumSize(240, 140)
+            mask_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             mask_preview.setStyleSheet("border: 1px solid #888; background: #262626;")
             card_layout.addWidget(mask_preview)
 
             colour_row = QHBoxLayout()
             paper_button = QPushButton("Paper colour")
-            paper_button.setMinimumWidth(120)
+            paper_button.setMinimumWidth(90)
             paper_button.clicked.connect(lambda checked, value=key: self._set_mask_reference_colour(value, "paper"))
             ink_button = QPushButton("Ink colour")
-            ink_button.setMinimumWidth(120)
+            ink_button.setMinimumWidth(90)
             ink_button.clicked.connect(lambda checked, value=key: self._set_mask_reference_colour(value, "ink"))
             colour_row.addWidget(paper_button)
             colour_row.addWidget(ink_button)
             card_layout.addLayout(colour_row)
 
             button = QPushButton(f"Generate mask for {key}")
-            button.setMinimumWidth(180)
+            button.setMinimumWidth(120)
             button.clicked.connect(lambda checked, value=key: self._generate_mask_for_key(value))
             card_layout.addWidget(button)
 
             remove_button = QPushButton(f"Remove mask for {key}")
-            remove_button.setMinimumWidth(180)
+            remove_button.setMinimumWidth(120)
             remove_button.clicked.connect(lambda checked, value=key: self._remove_mask_for_key(value))
             card_layout.addWidget(remove_button)
 
@@ -733,19 +1019,27 @@ class MainWindow(QMainWindow):
             grid.addWidget(card, 0, col)
 
         self.change_all_paper_button = QPushButton("Set all paper colours")
+        self.change_all_paper_button.setMinimumWidth(180)
+        self.change_all_paper_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_paper_button.clicked.connect(lambda: self._change_all_reference_colours("paper"))
         self.change_all_ink_button = QPushButton("Set all ink colours")
+        self.change_all_ink_button.setMinimumWidth(180)
+        self.change_all_ink_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_ink_button.clicked.connect(lambda: self._change_all_reference_colours("ink"))
-        self.change_all_paper_button.setFixedWidth(220)
-        self.change_all_ink_button.setFixedWidth(220)
 
         self.generate_all_masks_button = QPushButton("Generate masks for all")
+        self.generate_all_masks_button.setMinimumWidth(180)
+        self.generate_all_masks_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.generate_all_masks_button.clicked.connect(self._generate_mask_for_all)
-        self.generate_all_masks_button.setFixedWidth(220)
 
-        settings_layout.addWidget(self.change_all_paper_button)
-        settings_layout.addWidget(self.change_all_ink_button)
-        settings_layout.addWidget(self.generate_all_masks_button)
+        bulk_actions_row = QHBoxLayout()
+        bulk_actions_row.setContentsMargins(0, 0, 0, 0)
+        bulk_actions_row.setAlignment(Qt.AlignLeft)
+        bulk_actions_row.addWidget(self.change_all_paper_button)
+        bulk_actions_row.addWidget(self.change_all_ink_button)
+        bulk_actions_row.addWidget(self.generate_all_masks_button)
+        bulk_actions_row.addStretch(1)
+        settings_layout.addLayout(bulk_actions_row)
 
         layout.addLayout(grid)
         self._update_reference_colour_buttons()
