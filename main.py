@@ -510,14 +510,16 @@ class MainWindow(QMainWindow):
 
             paper_mask = self.paper_mask_arrays.get(key)
             ink_mask = self.ink_mask_arrays.get(key)
-            if paper_mask is None or ink_mask is None:
-                array = np.asarray(image)
-                h, w = array.shape[:2]
-                mask_papers.append(np.ones((h, w), dtype=bool))
-                mask_inks.append(np.zeros((h, w), dtype=bool))
-            else:
-                mask_papers.append(np.asarray(paper_mask, dtype=bool))
-                mask_inks.append(np.asarray(ink_mask, dtype=bool))
+            array = np.asarray(image)
+            h, w = array.shape[:2]
+
+            if paper_mask is None:
+                paper_mask = np.ones((h, w), dtype=bool)
+            if ink_mask is None:
+                ink_mask = np.ones((h, w), dtype=bool)
+
+            mask_papers.append(np.asarray(paper_mask, dtype=bool))
+            mask_inks.append(np.asarray(ink_mask, dtype=bool))
 
         if not mask_papers:
             return None, None
@@ -539,22 +541,19 @@ class MainWindow(QMainWindow):
             return
 
         if not self.use_mask_checkbox.isChecked():
-            self.alignment_preview.clear()
-            self.alignment_preview.setText("No mask found")
+            self._preview_from_array(self.alignment_preview, image)
             return
 
         if self.alignment_checkbox.isChecked():
             paper_mask, ink_mask = self._get_intersection_masks_for_alignment()
             if paper_mask is None or ink_mask is None:
-                self.alignment_preview.clear()
-                self.alignment_preview.setText("No mask found")
+                self._preview_from_array(self.alignment_preview, image)
                 return
         else:
             paper_mask = self.paper_mask_arrays.get(key)
             ink_mask = self.ink_mask_arrays.get(key)
             if paper_mask is None or ink_mask is None:
-                self.alignment_preview.clear()
-                self.alignment_preview.setText("No mask found")
+                self._preview_from_array(self.alignment_preview, image)
                 return
 
         if mode == "mask":
