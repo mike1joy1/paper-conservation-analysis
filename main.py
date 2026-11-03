@@ -299,6 +299,9 @@ class MainWindow(QMainWindow):
             for label in self.mask_original_labels.values():
                 label.setMinimumSize(80, 60)
                 label.setFixedHeight(thumb_height)
+                if hasattr(label, "_apply_fit_zoom"):
+                    label._apply_fit_zoom()
+                    label._refresh_zoomed_pixmap()
             for label in self.mask_preview_labels.values():
                 label.setMinimumSize(80, 60)
                 label.setFixedHeight(thumb_height)
@@ -437,6 +440,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "mask_original_labels") and key in self.mask_original_labels:
             self._preview_from_array(self.mask_original_labels[key], image)
 
+        if hasattr(self, "_update_alignment_mode_availability"):
+            self._update_alignment_mode_availability()
+
         if self.current_alignment_view == key:
             self._display_alignment_image()
 
@@ -492,6 +498,32 @@ class MainWindow(QMainWindow):
         layout.addLayout(grid)
         return page
 
+    def _get_intersection_masks_for_alignment(self):
+        """Return the intersection paper and ink masks across all loaded images when alignment mode is enabled."""
+        mask_papers = []
+        mask_inks = []
+
+        for key in ["B1", "B2", "A"]:
+            image = self.loaded_arrays.get(key)
+            if image is None:
+                return None, None
+
+            paper_mask = self.paper_mask_arrays.get(key)
+            ink_mask = self.ink_mask_arrays.get(key)
+            if paper_mask is None or ink_mask is None:
+                array = np.asarray(image)
+                h, w = array.shape[:2]
+                mask_papers.append(np.ones((h, w), dtype=bool))
+                mask_inks.append(np.zeros((h, w), dtype=bool))
+            else:
+                mask_papers.append(np.asarray(paper_mask, dtype=bool))
+                mask_inks.append(np.asarray(ink_mask, dtype=bool))
+
+        if not mask_papers:
+            return None, None
+
+        return np.logical_and.reduce(mask_papers), np.logical_and.reduce(mask_inks)
+
     def _display_alignment_image(self):
         """Show one of the three images in the alignment check area."""
         key = self.current_alignment_view
@@ -506,22 +538,30 @@ class MainWindow(QMainWindow):
             self._preview_from_array(self.alignment_preview, image)
             return
 
-        if mode == "mask":
-            if not self.use_mask_checkbox.isChecked():
+        if not self.use_mask_checkbox.isChecked():
+            self.alignment_preview.clear()
+            self.alignment_preview.setText("No mask found")
+            return
+
+        if self.alignment_checkbox.isChecked():
+            paper_mask, ink_mask = self._get_intersection_masks_for_alignment()
+            if paper_mask is None or ink_mask is None:
                 self.alignment_preview.clear()
                 self.alignment_preview.setText("No mask found")
                 return
+        else:
             paper_mask = self.paper_mask_arrays.get(key)
             ink_mask = self.ink_mask_arrays.get(key)
             if paper_mask is None or ink_mask is None:
                 self.alignment_preview.clear()
                 self.alignment_preview.setText("No mask found")
                 return
+
+        if mode == "mask":
             self._display_mask_preview(
                 self.alignment_preview,
                 paper_mask=paper_mask,
                 ink_mask=ink_mask,
-                border_mask=self.mask_border_arrays.get(key),
             )
             return
 
@@ -531,12 +571,6 @@ class MainWindow(QMainWindow):
         if array.shape[-1] == 1:
             array = np.repeat(array, 3, axis=-1)
         array = np.clip(array, 0.0, 1.0)
-
-        paper_mask = self.paper_mask_arrays.get(key)
-        ink_mask = self.ink_mask_arrays.get(key)
-        if not self.use_mask_checkbox.isChecked() or paper_mask is None or ink_mask is None:
-            self._preview_from_array(self.alignment_preview, image)
-            return
 
         paper_bool = np.asarray(paper_mask, dtype=bool)
         ink_bool = np.asarray(ink_mask, dtype=bool)
@@ -564,6 +598,27 @@ class MainWindow(QMainWindow):
         self._update_alignment_buttons()
         self._display_alignment_image()
 
+    def _images_have_identical_resolution(self):
+        sizes = []
+        for key in ["B1", "B2", "A"]:
+            image = self.loaded_arrays.get(key)
+            if image is None:
+                return False
+            array = np.asarray(image)
+            if array.ndim == 0:
+                return False
+            sizes.append(tuple(array.shape[:2]))
+        return len(set(sizes)) == 1
+
+    def _update_alignment_mode_availability(self):
+        if not hasattr(self, "alignment_checkbox"):
+            return
+
+        available = self._images_have_identical_resolution()
+        self.alignment_checkbox.setEnabled(available)
+        if not available:
+            self.alignment_checkbox.setChecked(False)
+
     def _update_alignment_buttons(self):
         for key, button in self.alignment_buttons.items():
             button.setChecked(key == self.current_alignment_view)
@@ -581,8 +636,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
 
-        self.alignment_checkbox = QCheckBox("Images are aligned")
+        self.alignment_checkbox = QCheckBox("Aligned image mode")
         self.alignment_checkbox.setChecked(False)
+        self.alignment_checkbox.setEnabled(False)
+        self.alignment_checkbox.toggled.connect(lambda checked: self._display_alignment_image())
         layout.addWidget(self.alignment_checkbox)
 
         view_group = QGroupBox("Alignment view")
@@ -610,6 +667,7 @@ class MainWindow(QMainWindow):
         self.overlay_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.overlay_button.clicked.connect(self._choose_mask_overlay_colour)
         self._update_overlay_button_style()
+        self._update_alignment_mode_availability()
         overlay_row = QHBoxLayout()
         overlay_row.setAlignment(Qt.AlignLeft)
         overlay_row.addWidget(self.overlay_button)
@@ -977,7 +1035,7 @@ class MainWindow(QMainWindow):
             card = QWidget()
             card_layout = QVBoxLayout(card)
 
-            original_preview = QLabel(f"Original {key}")
+            original_preview = ZoomableLabel(f"Original {key}")
             original_preview.setAlignment(Qt.AlignCenter)
             original_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             original_preview.setStyleSheet("border: 1px solid #888; background: #262626;")
