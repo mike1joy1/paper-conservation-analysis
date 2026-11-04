@@ -234,6 +234,147 @@ class ClickableLabel(ZoomableLabel):
     pass
 
 
+class image_data_colour:
+    """Container for a single image and the related pixel and mask state."""
+
+    def __init__(self, key: str, file_path: str | None = None):
+        self.key = key
+        self.file_path = file_path
+        self.pixels: dict[str, np.ndarray] = {}
+        self.masks: dict[str, np.ndarray] = {}
+        self.mask_border: np.ndarray | None = None
+        self.masks_exists: dict[str, bool] = {"paper": False, "ink": False}
+        self.reference_colours = {
+            "paper": QColor("white"),
+            "ink": QColor("black"),
+        }
+        self._reset_masks_to_full()
+
+    def _reset_masks_to_full(self):
+        if "rgb" in self.pixels:
+            shape = np.asarray(self.pixels["rgb"]).shape[:2]
+        else:
+            shape = (0, 0)
+
+        if shape[0] == 0 or shape[1] == 0:
+            self.masks = {"paper": None, "ink": None}
+            self.mask_border = np.zeros((0, 0), dtype=bool)
+            self.masks_exists = {"paper": False, "ink": False}
+            return
+
+        self.masks = {
+            "paper": np.ones(shape, dtype=bool),
+            "ink": np.ones(shape, dtype=bool),
+        }
+        self.mask_border = np.zeros(shape, dtype=bool)
+        self.masks_exists = {"paper": False, "ink": False}
+
+    def clear_masks(self):
+        self._reset_masks_to_full()
+
+    def get_pixels(self, colourspace: str):
+        if colourspace in self.pixels:
+            return np.asarray(self.pixels[colourspace], dtype=np.float32)
+        if colourspace == "lab":
+            return self.generate_lab_pixels()
+        raise KeyError(f"Unknown colourspace '{colourspace}'")
+
+    def set_mask(self, name: str, mask: np.ndarray):
+        if name not in {"paper", "ink"}:
+            raise ValueError(f"Unsupported mask '{name}'")
+        array = np.asarray(mask, dtype=bool)
+        self.masks[name] = array
+        self.masks_exists[name] = True
+
+    def load_from_path(self, path: str):
+        self.file_path = path
+        image = load_image(path)
+        rgb = np.asarray(image, dtype=np.float32)
+        if rgb.ndim == 2:
+            rgb = np.repeat(rgb[..., None], 3, axis=-1)
+        if rgb.shape[-1] == 1:
+            rgb = np.repeat(rgb, 3, axis=-1)
+        if rgb.size > 0 and rgb.max() > 1.0:
+            rgb = rgb / 255.0
+        self.pixels["rgb"] = np.clip(rgb, 0.0, 1.0)
+        self.generate_lab_pixels()
+        self._reset_masks_to_full()
+        return self.pixels["rgb"]
+
+    def generate_lab_pixels(self):
+        if "rgb" not in self.pixels:
+            return None
+
+        rgb = np.asarray(self.pixels["rgb"], dtype=np.float32)
+        if rgb.ndim == 2:
+            rgb = np.repeat(rgb[..., None], 3, axis=-1)
+        if rgb.shape[-1] == 1:
+            rgb = np.repeat(rgb, 3, axis=-1)
+        if rgb.size == 0:
+            self.pixels["lab"] = rgb.copy()
+            return self.pixels["lab"]
+
+        rgb = np.clip(rgb, 0.0, 1.0)
+        rgb_linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        r, g, b = rgb_linear[..., 0], rgb_linear[..., 1], rgb_linear[..., 2]
+        x = 0.4124 * r + 0.3576 * g + 0.1805 * b
+        y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        z = 0.0193 * r + 0.1192 * g + 0.9505 * b
+
+        white_ref = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+        xyz = np.stack([x, y, z], axis=-1)
+        xyz = xyz / white_ref
+        f_xyz = np.where(xyz > 0.008856, xyz ** (1.0 / 3.0), (7.787 * xyz) + (16.0 / 116.0))
+
+        l_channel = 116.0 * f_xyz[..., 1] - 16.0
+        a_channel = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
+        b_channel = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
+        lab = np.stack([l_channel, a_channel, b_channel], axis=-1)
+        self.pixels["lab"] = lab
+        return lab
+
+    def generate_masks(self, mode: str, threshold: int = 140, reference_weight: float = 0.5, border_pixels: int = 2):
+        rgb_array = self.get_pixels("rgb")
+        if rgb_array is None:
+            return None, None, None
+
+        if mode == "luminance":
+            brightness = np.mean(rgb_array, axis=-1)
+            threshold_value = threshold / 255.0
+            ink_mask = brightness <= threshold_value
+        else:
+            paper_colour = np.array(self.reference_colours["paper"].getRgb()[:3], dtype=np.float32) / 255.0
+            ink_colour = np.array(self.reference_colours["ink"].getRgb()[:3], dtype=np.float32) / 255.0
+            paper_distance = np.linalg.norm(rgb_array - paper_colour, axis=-1)
+            ink_distance = np.linalg.norm(rgb_array - ink_colour, axis=-1)
+            max_distance = np.sqrt(3.0)
+            paper_weight = float(reference_weight)
+            adjusted_paper_distance = paper_weight * paper_distance + (1.0 - paper_weight) * max_distance
+            adjusted_ink_distance = (1.0 - paper_weight) * ink_distance + paper_weight * max_distance
+            ink_mask = adjusted_paper_distance > adjusted_ink_distance
+
+        original_ink_mask = np.asarray(ink_mask, dtype=bool).copy()
+        original_paper_mask = (~original_ink_mask).astype(bool)
+
+        if border_pixels > 0:
+            paper_mask = binary_erosion(original_paper_mask, iterations=border_pixels)
+            ink_mask = binary_erosion(original_ink_mask, iterations=border_pixels)
+            border_mask = (original_ink_mask ^ binary_erosion(original_ink_mask, iterations=1)) | (
+                original_paper_mask ^ binary_erosion(original_paper_mask, iterations=1)
+            )
+        else:
+            paper_mask = original_paper_mask
+            ink_mask = original_ink_mask
+            border_mask = np.zeros_like(original_ink_mask, dtype=bool)
+
+        self.masks["paper"] = np.asarray(paper_mask, dtype=bool)
+        self.masks["ink"] = np.asarray(ink_mask, dtype=bool)
+        self.mask_border = np.asarray(border_mask, dtype=bool)
+        self.masks_exists["paper"] = True
+        self.masks_exists["ink"] = True
+        return paper_mask, ink_mask, border_mask
+
+
 class MainWindow(QMainWindow):
     """The main window containing the five-step analysis workflow."""
 
@@ -245,17 +386,8 @@ class MainWindow(QMainWindow):
 
         # The scientific workflow assumes the images are already aligned and cropped
         # before they are opened in this app.
-        self.image_paths = {"B1": None, "B2": None, "A": None}
-        self.loaded_arrays = {"B1": None, "B2": None, "A": None}
-        self.ink_mask_arrays = {"B1": None, "B2": None, "A": None}
-        self.paper_mask_arrays = {"B1": None, "B2": None, "A": None}
-        self.mask_arrays = self.ink_mask_arrays
-        self.mask_border_arrays = {"B1": None, "B2": None, "A": None}
-        self.mask_reference_colours = {
-            "B1": {"paper": QColor("white"), "ink": QColor("black")},
-            "B2": {"paper": QColor("white"), "ink": QColor("black")},
-            "A": {"paper": QColor("white"), "ink": QColor("black")},
-        }
+        self.images = {key: image_data_colour(key) for key in ["B1", "B2", "A"]}
+        self.mask_reference_colours = {key: self.images[key].reference_colours for key in ["B1", "B2", "A"]}
         self.current_alignment_view = "B1"
         self.alignment_display_mode = "original"
         self.mask_overlay_colour = QColor("blue")
@@ -451,16 +583,17 @@ class MainWindow(QMainWindow):
             self.overlay_button.setText(f" Mask overlay colour: {self.mask_overlay_colour.name()} ")
 
     def _ensure_image_loaded_for_key(self, key: str):
-        """Restore an image array from disk if the loaded state has been lost but the file path still exists."""
-        if self.loaded_arrays.get(key) is not None:
+        """Restore an image object from disk if the loaded state has been lost but the file path still exists."""
+        image_data = self.images[key]
+        if image_data.pixels.get("rgb") is not None:
             return True
 
-        path = self.image_paths.get(key)
+        path = image_data.file_path
         if not path or not Path(path).exists():
             return False
 
         try:
-            self.loaded_arrays[key] = load_image(path)
+            image_data.load_from_path(path)
             return True
         except Exception:
             return False
@@ -470,7 +603,7 @@ class MainWindow(QMainWindow):
         if not self._ensure_image_loaded_for_key(key):
             return
 
-        image = self.loaded_arrays[key]
+        image = self.images[key].get_pixels("rgb")
 
         if hasattr(self, "load_preview_labels") and key in self.load_preview_labels:
             self._preview_from_array(self.load_preview_labels[key], image)
@@ -482,7 +615,7 @@ class MainWindow(QMainWindow):
             self._display_alignment_image()
 
     def _open_image_for_key(self, key: str):
-        """Open a single image and store it in the loaded arrays for the given key."""
+        """Open a single image and store it in the image object for the given key."""
         path, _ = QFileDialog.getOpenFileName(
             self,
             f"Select {key} image",
@@ -492,12 +625,11 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        self.image_paths[key] = path
-        image = load_image(path)
-        self.loaded_arrays[key] = image
+        image_data = self.images[key]
+        image_data.load_from_path(path)
 
         preview_label = self.load_preview_labels[key]
-        self._preview_from_array(preview_label, image)
+        self._preview_from_array(preview_label, image_data.get_pixels("rgb"))
         self.path_labels[key].setText(path)
         self.image_details_labels[key].setText(self._image_file_details(path))
 
@@ -586,13 +718,13 @@ class MainWindow(QMainWindow):
         mask_inks = []
 
         for key in ["B1", "B2", "A"]:
-            image = self.loaded_arrays.get(key)
-            if image is None:
+            image_data = self.images[key]
+            if image_data.pixels.get("rgb") is None:
                 return None, None
 
-            paper_mask = self.paper_mask_arrays.get(key)
-            ink_mask = self.ink_mask_arrays.get(key)
-            array = np.asarray(image)
+            paper_mask = image_data.masks.get("paper")
+            ink_mask = image_data.masks.get("ink")
+            array = np.asarray(image_data.get_pixels("rgb"))
             h, w = array.shape[:2]
 
             if paper_mask is None:
@@ -611,7 +743,8 @@ class MainWindow(QMainWindow):
     def _display_alignment_image(self):
         """Show one of the three images in the alignment check area."""
         key = self.current_alignment_view
-        image = self.loaded_arrays.get(key)
+        image_data = self.images[key]
+        image = image_data.get_pixels("rgb") if image_data.pixels.get("rgb") is not None else None
         if image is None:
             self.alignment_preview.setText(f"{key} not loaded")
             self.alignment_preview.setPixmap(QPixmap())
@@ -632,8 +765,8 @@ class MainWindow(QMainWindow):
                 self._preview_from_array(self.alignment_preview, image)
                 return
         else:
-            paper_mask = self.paper_mask_arrays.get(key)
-            ink_mask = self.ink_mask_arrays.get(key)
+            paper_mask = image_data.masks.get("paper")
+            ink_mask = image_data.masks.get("ink")
             if paper_mask is None or ink_mask is None:
                 self._preview_from_array(self.alignment_preview, image)
                 return
@@ -682,7 +815,8 @@ class MainWindow(QMainWindow):
     def _images_have_identical_resolution(self):
         sizes = []
         for key in ["B1", "B2", "A"]:
-            image = self.loaded_arrays.get(key)
+            image_data = self.images[key]
+            image = image_data.pixels.get("rgb")
             if image is None:
                 return False
             array = np.asarray(image)
@@ -849,28 +983,31 @@ class MainWindow(QMainWindow):
             self._display_alignment_image()
 
     def _set_mask_reference_colour(self, key: str, region: str):
-        colour = QColorDialog.getColor(self.mask_reference_colours[key][region], self, f"Select {region} colour for {key}")
+        image_data = self.images[key]
+        colour = QColorDialog.getColor(image_data.reference_colours[region], self, f"Select {region} colour for {key}")
         if not colour.isValid():
             return
 
-        self.mask_reference_colours[key][region] = colour
+        image_data.reference_colours[region] = colour
+        self.mask_reference_colours[key] = image_data.reference_colours
         self._update_reference_colour_buttons()
 
     def _change_all_reference_colours(self, region: str):
-        representative = self.mask_reference_colours["B1"][region]
+        representative = self.images["B1"].reference_colours[region]
         colour = QColorDialog.getColor(representative, self, f"Select all {region} colours")
         if not colour.isValid():
             return
 
         for key in ["B1", "B2", "A"]:
-            self.mask_reference_colours[key][region] = colour
+            self.images[key].reference_colours[region] = colour
+            self.mask_reference_colours[key] = self.images[key].reference_colours
 
         self._update_reference_colour_buttons()
 
     def _update_reference_colour_buttons(self):
         for key in ["B1", "B2", "A"]:
-            paper_colour = self.mask_reference_colours[key]["paper"]
-            ink_colour = self.mask_reference_colours[key]["ink"]
+            paper_colour = self.images[key].reference_colours["paper"]
+            ink_colour = self.images[key].reference_colours["ink"]
             self._apply_button_colour(self.paper_colour_buttons[key], paper_colour)
             self._apply_button_colour(self.ink_colour_buttons[key], ink_colour)
             self.paper_colour_buttons[key].setText(f"Paper: {paper_colour.name()}")
@@ -889,59 +1026,23 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing image", f"Load {key} before generating a mask.")
             return
 
-        image = self.loaded_arrays.get(key)
+        image_data = self.images[key]
+        paper_mask, ink_mask, border_mask = image_data.generate_masks(
+            self.mask_mode,
+            threshold=self.mask_threshold_slider.value(),
+            reference_weight=self.reference_weight_slider.value() / 100.0,
+            border_pixels=self.mask_border_slider.value(),
+        )
 
-        array = np.asarray(image, dtype=np.float32)
-        if array.ndim == 3:
-            rgb_array = array.copy()
-            if rgb_array.max() > 1.0:
-                rgb_array = rgb_array / 255.0
-        else:
-            rgb_array = np.repeat(array[..., None], 3, axis=-1)
-            if rgb_array.max() > 1.0:
-                rgb_array = rgb_array / 255.0
+        if paper_mask is None or ink_mask is None:
+            return
 
-        if self.mask_mode == "luminance":
-            brightness = np.mean(rgb_array, axis=-1)
-            threshold = self.mask_threshold_slider.value() / 255.0
-            ink_mask = brightness <= threshold
-        else:
-            paper_colour = np.array(self.mask_reference_colours[key]["paper"].getRgb()[:3], dtype=np.float32) / 255.0
-            ink_colour = np.array(self.mask_reference_colours[key]["ink"].getRgb()[:3], dtype=np.float32) / 255.0
-            paper_distance = np.linalg.norm(rgb_array - paper_colour, axis=-1)
-            ink_distance = np.linalg.norm(rgb_array - ink_colour, axis=-1)
-            max_distance = np.sqrt(3.0)
-            paper_weight = self.reference_weight_slider.value() / 100.0
-            adjusted_paper_distance = paper_weight * paper_distance + (1.0 - paper_weight) * max_distance
-            adjusted_ink_distance = (1.0 - paper_weight) * ink_distance + paper_weight * max_distance
-            ink_mask = adjusted_paper_distance > adjusted_ink_distance
-
-        original_ink_mask = ink_mask.copy()
-        original_paper_mask = (~original_ink_mask).astype(bool)
-        border_pixels = self.mask_border_slider.value()
-
-        if border_pixels > 0:
-            paper_mask = binary_erosion(original_paper_mask, iterations=border_pixels)
-            ink_mask = binary_erosion(original_ink_mask, iterations=border_pixels)
-            border_mask = (original_ink_mask ^ binary_erosion(original_ink_mask, iterations=1)) | (
-                original_paper_mask ^ binary_erosion(original_paper_mask, iterations=1)
-            )
-        else:
-            paper_mask = original_paper_mask
-            ink_mask = original_ink_mask
-            border_mask = np.zeros_like(original_ink_mask, dtype=bool)
-
-        self.ink_mask_arrays[key] = ink_mask
-        self.paper_mask_arrays[key] = paper_mask
-        self.mask_arrays[key] = ink_mask
-        self.mask_border_arrays[key] = border_mask
-
-        if self.ink_mask_arrays.get(key) is not None:
+        if image_data.masks.get("ink") is not None:
             self._display_mask_preview(
                 self.mask_preview_labels[key],
-                paper_mask=self.paper_mask_arrays.get(key),
-                ink_mask=self.ink_mask_arrays.get(key),
-                border_mask=self.mask_border_arrays.get(key),
+                paper_mask=image_data.masks.get("paper"),
+                ink_mask=image_data.masks.get("ink"),
+                border_mask=image_data.mask_border,
             )
 
         self._display_alignment_image()
@@ -949,15 +1050,13 @@ class MainWindow(QMainWindow):
     def _generate_mask_for_all(self):
         """Generate masks for all images currently loaded into the app."""
         for key in ["B1", "B2", "A"]:
-            if self.loaded_arrays.get(key) is not None:
+            if self.images[key].pixels.get("rgb") is not None:
                 self._generate_mask_for_key(key)
 
     def _remove_mask_for_key(self, key: str):
         """Clear the saved mask for a single image, leaving the original image visible."""
-        self.ink_mask_arrays[key] = None
-        self.paper_mask_arrays[key] = None
-        self.mask_arrays[key] = None
-        self.mask_border_arrays[key] = None
+        image_data = self.images[key]
+        image_data.clear_masks()
 
         if key in self.mask_preview_labels:
             self.mask_preview_labels[key].clear()
@@ -1108,7 +1207,6 @@ class MainWindow(QMainWindow):
         self.ink_colour_buttons = {}
         self.mask_generate_buttons = {}
         self.mask_remove_buttons = {}
-        self.mask_border_arrays = {"B1": None, "B2": None, "A": None}
         grid = QGridLayout()
         grid.setAlignment(Qt.AlignTop)
         grid.setHorizontalSpacing(8)
@@ -1250,14 +1348,14 @@ class MainWindow(QMainWindow):
 
     def analyze_images(self):
         """Run the comparison for the three loaded images and report the result."""
-        if self.image_paths["B1"] is None or self.image_paths["B2"] is None or self.image_paths["A"] is None:
+        if any(self.images[key].pixels.get("rgb") is None for key in ["B1", "B2", "A"]):
             QMessageBox.warning(self, "Missing input", "Load B1, B2, and A before running the analysis.")
             return
 
         try:
-            b1 = load_image(self.image_paths["B1"])
-            b2 = load_image(self.image_paths["B2"])
-            a = load_image(self.image_paths["A"])
+            b1 = self.images["B1"].get_pixels("rgb")
+            b2 = self.images["B2"].get_pixels("rgb")
+            a = self.images["A"].get_pixels("rgb")
             results = evaluate_reference_pair(b1, b2, a)
             base = results["base"]
             test = results["test"]

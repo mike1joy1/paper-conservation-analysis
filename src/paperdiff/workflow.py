@@ -74,7 +74,7 @@ def describe_region_change(metrics: dict[str, float], region_name: str = "region
 def evaluate_reference_pair(b1: np.ndarray, b2: np.ndarray, a: np.ndarray) -> dict[str, dict[str, object]]:
     """Compare B1 with B2 and A using the already-aligned input images.
 
-    The workflow is intentionally simple:
+    The workflow:
     1. Build a paper/ink mask from B1.
     2. Compute per-pixel colour deltas between B1 and each comparison image.
     3. Summarise the change in the paper and ink regions.
