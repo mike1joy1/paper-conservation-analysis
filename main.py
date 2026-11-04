@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 from scipy.ndimage import binary_erosion
 
 # Add the source tree to the import path so the app can import the package.
@@ -395,6 +396,37 @@ class MainWindow(QMainWindow):
         painter.end()
         label.setPixmap(fit_pixmap)
 
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Convert byte counts into a readable value suitable for display in the UI."""
+        units = ["B", "KB", "MB", "GB"]
+        value = float(size_bytes)
+        unit_index = 0
+        while value >= 1024 and unit_index < len(units) - 1:
+            value /= 1024.0
+            unit_index += 1
+
+        if unit_index == 0:
+            return f"{int(value)} {units[unit_index]}"
+        return f"{value:.1f} {units[unit_index]}"
+
+    def _image_file_details(self, path: str) -> str:
+        """Return a short metadata summary for an image file."""
+        if not path:
+            return "No image details"
+
+        try:
+            file_path = Path(path)
+            file_size = file_path.stat().st_size
+            with Image.open(file_path) as image:
+                width, height = image.size
+                bits = getattr(image, "bits", "unknown")
+                format_name = (image.format or file_path.suffix.lstrip(".") or "unknown").lower()
+                return f"{width} × {height}px • {bits}-bit • {format_name} • {self._format_file_size(file_size)}"
+        except Exception:
+            suffix = Path(path).suffix.lstrip(".").lower() or "unknown"
+            size = Path(path).stat().st_size if Path(path).exists() else 0
+            return f"Unknown size • {suffix} • {self._format_file_size(size)}"
+
     def _set_preview_text(self, label: QLabel, text: str):
         label.setText(text)
         label.setPixmap(QPixmap())
@@ -418,6 +450,37 @@ class MainWindow(QMainWindow):
             self._apply_button_colour(self.overlay_button, self.mask_overlay_colour)
             self.overlay_button.setText(f" Mask overlay colour: {self.mask_overlay_colour.name()} ")
 
+    def _ensure_image_loaded_for_key(self, key: str):
+        """Restore an image array from disk if the loaded state has been lost but the file path still exists."""
+        if self.loaded_arrays.get(key) is not None:
+            return True
+
+        path = self.image_paths.get(key)
+        if not path or not Path(path).exists():
+            return False
+
+        try:
+            self.loaded_arrays[key] = load_image(path)
+            return True
+        except Exception:
+            return False
+
+    def _refresh_loaded_image_previews_for_key(self, key: str):
+        """Keep the load, mask, and alignment previews in sync for the selected image key."""
+        if not self._ensure_image_loaded_for_key(key):
+            return
+
+        image = self.loaded_arrays[key]
+
+        if hasattr(self, "load_preview_labels") and key in self.load_preview_labels:
+            self._preview_from_array(self.load_preview_labels[key], image)
+
+        if hasattr(self, "mask_original_labels") and key in self.mask_original_labels:
+            self._preview_from_array(self.mask_original_labels[key], image)
+
+        if hasattr(self, "alignment_preview") and self.current_alignment_view == key:
+            self._display_alignment_image()
+
     def _open_image_for_key(self, key: str):
         """Open a single image and store it in the loaded arrays for the given key."""
         path, _ = QFileDialog.getOpenFileName(
@@ -436,9 +499,9 @@ class MainWindow(QMainWindow):
         preview_label = self.load_preview_labels[key]
         self._preview_from_array(preview_label, image)
         self.path_labels[key].setText(path)
+        self.image_details_labels[key].setText(self._image_file_details(path))
 
-        if hasattr(self, "mask_original_labels") and key in self.mask_original_labels:
-            self._preview_from_array(self.mask_original_labels[key], image)
+        self._refresh_loaded_image_previews_for_key(key)
 
         if hasattr(self, "_update_alignment_mode_availability"):
             self._update_alignment_mode_availability()
@@ -470,19 +533,30 @@ class MainWindow(QMainWindow):
 
         self.load_preview_labels = {}
         self.path_labels = {}
+        self.image_details_labels = {}
+        self.image_key_labels = {"B1": "Before image 1", "B2": "Before image2", "A": "After image"}
         grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+
         for col, key in enumerate(["B1", "B2", "A"]):
             card = QWidget()
+            card.setFixedHeight(285)
+            card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(8, 8, 8, 8)
+            card_layout.setSpacing(6)
 
-            preview_label = QLabel(f"{key}")
+            preview_label = QLabel(self.image_key_labels[key])
             preview_label.setAlignment(Qt.AlignCenter)
-            preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            preview_label.setFixedHeight(300)
+            preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             preview_label.setStyleSheet("border: 1px solid #888; background: #262626;")
             card_layout.addWidget(preview_label)
 
-            button = QPushButton(f"Load {key}")
+            button = QPushButton(f"Load {self.image_key_labels[key]}")
             button.clicked.connect(lambda checked, value=key: self._open_image_for_key(value))
+            button.setFixedHeight(30)
             card_layout.addWidget(button)
 
             path_label = QLabel("No file selected")
@@ -491,8 +565,16 @@ class MainWindow(QMainWindow):
             path_label.setAlignment(Qt.AlignTop)
             card_layout.addWidget(path_label)
 
+            details_label = QLabel("No image details")
+            details_label.setWordWrap(True)
+            details_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            details_label.setAlignment(Qt.AlignLeft)
+            details_label.setStyleSheet("font-size: 10px; color: #d0d0d0;")
+            card_layout.addWidget(details_label)
+
             self.load_preview_labels[key] = preview_label
             self.path_labels[key] = path_label
+            self.image_details_labels[key] = details_label
             grid.addWidget(card, 0, col)
 
         layout.addLayout(grid)
@@ -803,10 +885,11 @@ class MainWindow(QMainWindow):
 
     def _generate_mask_for_key(self, key: str):
         """Create separate paper and ink masks and keep the red border out of both."""
-        image = self.loaded_arrays.get(key)
-        if image is None:
+        if not self._ensure_image_loaded_for_key(key):
             QMessageBox.warning(self, "Missing image", f"Load {key} before generating a mask.")
             return
+
+        image = self.loaded_arrays.get(key)
 
         array = np.asarray(image, dtype=np.float32)
         if array.ndim == 3:
