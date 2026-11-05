@@ -1,12 +1,12 @@
 # Paper Conservation Analysis
 
-A desktop application for comparing paper images and reporting visible differences between reference and comparison states.
+A desktop application for comparing images of paper (with ink) and reporting visible differences between reference and comparison states. Designed for paper conservation purposes.
 
 ## Overview
 
 This app is designed for a simple conservation workflow:
 
-- Load three images: B1, B2, and A
+- Load three images: 2x before images (B1 and B2) and one after image (A)
 - Review and adjust masks for paper and ink regions
 - Check image alignment visually
 - Compare the images using configured analysis options
@@ -17,7 +17,8 @@ This app is designed for a simple conservation workflow:
 - Load and preview B1, B2, and A images
 - Generate paper and ink masks using luminance or reference-colour modes
 - Inspect mask overlays and alignment previews
-- Compare RGB and LAB image data
+- Compare RGB and LAB image data between before and after images
+- Use the two before images to compensate for alignment imperfections and noise 
 - Optionally compare using masks and intersection masks
 - Generate a readable analysis summary for each comparison
 
@@ -61,4 +62,4 @@ python main.py
 
 ## Notes
 
-This project assumes the images have already been aligned and cropped before they are loaded into the application. The app focuses on the comparison and reporting workflow rather than image preparation.
+This project assumes the images have already been colour corrected and aligned and cropped before they are loaded into the application (e.g. using Auto-Align Layers in Photoshop). The app focuses on the comparison and reporting workflow rather than image preparation.
