@@ -1,3 +1,3 @@
-from .workflow import describe_region_change, evaluate_reference_pair
+from .workflow import describe_region_change, compare_images
 
-__all__ = ["evaluate_reference_pair", "describe_region_change"]
+__all__ = ["compare_images", "describe_region_change"]

@@ -42,9 +42,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from paperdiff.image_state import analysis_options, image_data_colour
 from paperdiff.loading import load_image
 from paperdiff.stats import verdict_for_region
-from paperdiff.workflow import describe_region_change, evaluate_reference_pair
+from paperdiff.workflow import describe_region_change, compare_images
 
 
 class ZoomableLabel(QLabel):
@@ -234,147 +235,6 @@ class ClickableLabel(ZoomableLabel):
     pass
 
 
-class image_data_colour:
-    """Container for a single image and the related pixel and mask state."""
-
-    def __init__(self, key: str, file_path: str | None = None):
-        self.key = key
-        self.file_path = file_path
-        self.pixels: dict[str, np.ndarray] = {}
-        self.masks: dict[str, np.ndarray] = {}
-        self.mask_border: np.ndarray | None = None
-        self.masks_exists: dict[str, bool] = {"paper": False, "ink": False}
-        self.reference_colours = {
-            "paper": QColor("white"),
-            "ink": QColor("black"),
-        }
-        self._reset_masks_to_full()
-
-    def _reset_masks_to_full(self):
-        if "rgb" in self.pixels:
-            shape = np.asarray(self.pixels["rgb"]).shape[:2]
-        else:
-            shape = (0, 0)
-
-        if shape[0] == 0 or shape[1] == 0:
-            self.masks = {"paper": None, "ink": None}
-            self.mask_border = np.zeros((0, 0), dtype=bool)
-            self.masks_exists = {"paper": False, "ink": False}
-            return
-
-        self.masks = {
-            "paper": np.ones(shape, dtype=bool),
-            "ink": np.ones(shape, dtype=bool),
-        }
-        self.mask_border = np.zeros(shape, dtype=bool)
-        self.masks_exists = {"paper": False, "ink": False}
-
-    def clear_masks(self):
-        self._reset_masks_to_full()
-
-    def get_pixels(self, colourspace: str):
-        if colourspace in self.pixels:
-            return np.asarray(self.pixels[colourspace], dtype=np.float32)
-        if colourspace == "lab":
-            return self.generate_lab_pixels()
-        raise KeyError(f"Unknown colourspace '{colourspace}'")
-
-    def set_mask(self, name: str, mask: np.ndarray):
-        if name not in {"paper", "ink"}:
-            raise ValueError(f"Unsupported mask '{name}'")
-        array = np.asarray(mask, dtype=bool)
-        self.masks[name] = array
-        self.masks_exists[name] = True
-
-    def load_from_path(self, path: str):
-        self.file_path = path
-        image = load_image(path)
-        rgb = np.asarray(image, dtype=np.float32)
-        if rgb.ndim == 2:
-            rgb = np.repeat(rgb[..., None], 3, axis=-1)
-        if rgb.shape[-1] == 1:
-            rgb = np.repeat(rgb, 3, axis=-1)
-        if rgb.size > 0 and rgb.max() > 1.0:
-            rgb = rgb / 255.0
-        self.pixels["rgb"] = np.clip(rgb, 0.0, 1.0)
-        self.generate_lab_pixels()
-        self._reset_masks_to_full()
-        return self.pixels["rgb"]
-
-    def generate_lab_pixels(self):
-        if "rgb" not in self.pixels:
-            return None
-
-        rgb = np.asarray(self.pixels["rgb"], dtype=np.float32)
-        if rgb.ndim == 2:
-            rgb = np.repeat(rgb[..., None], 3, axis=-1)
-        if rgb.shape[-1] == 1:
-            rgb = np.repeat(rgb, 3, axis=-1)
-        if rgb.size == 0:
-            self.pixels["lab"] = rgb.copy()
-            return self.pixels["lab"]
-
-        rgb = np.clip(rgb, 0.0, 1.0)
-        rgb_linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-        r, g, b = rgb_linear[..., 0], rgb_linear[..., 1], rgb_linear[..., 2]
-        x = 0.4124 * r + 0.3576 * g + 0.1805 * b
-        y = 0.2126 * r + 0.7152 * g + 0.0722 * b
-        z = 0.0193 * r + 0.1192 * g + 0.9505 * b
-
-        white_ref = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
-        xyz = np.stack([x, y, z], axis=-1)
-        xyz = xyz / white_ref
-        f_xyz = np.where(xyz > 0.008856, xyz ** (1.0 / 3.0), (7.787 * xyz) + (16.0 / 116.0))
-
-        l_channel = 116.0 * f_xyz[..., 1] - 16.0
-        a_channel = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
-        b_channel = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
-        lab = np.stack([l_channel, a_channel, b_channel], axis=-1)
-        self.pixels["lab"] = lab
-        return lab
-
-    def generate_masks(self, mode: str, threshold: int = 140, reference_weight: float = 0.5, border_pixels: int = 2):
-        rgb_array = self.get_pixels("rgb")
-        if rgb_array is None:
-            return None, None, None
-
-        if mode == "luminance":
-            brightness = np.mean(rgb_array, axis=-1)
-            threshold_value = threshold / 255.0
-            ink_mask = brightness <= threshold_value
-        else:
-            paper_colour = np.array(self.reference_colours["paper"].getRgb()[:3], dtype=np.float32) / 255.0
-            ink_colour = np.array(self.reference_colours["ink"].getRgb()[:3], dtype=np.float32) / 255.0
-            paper_distance = np.linalg.norm(rgb_array - paper_colour, axis=-1)
-            ink_distance = np.linalg.norm(rgb_array - ink_colour, axis=-1)
-            max_distance = np.sqrt(3.0)
-            paper_weight = float(reference_weight)
-            adjusted_paper_distance = paper_weight * paper_distance + (1.0 - paper_weight) * max_distance
-            adjusted_ink_distance = (1.0 - paper_weight) * ink_distance + paper_weight * max_distance
-            ink_mask = adjusted_paper_distance > adjusted_ink_distance
-
-        original_ink_mask = np.asarray(ink_mask, dtype=bool).copy()
-        original_paper_mask = (~original_ink_mask).astype(bool)
-
-        if border_pixels > 0:
-            paper_mask = binary_erosion(original_paper_mask, iterations=border_pixels)
-            ink_mask = binary_erosion(original_ink_mask, iterations=border_pixels)
-            border_mask = (original_ink_mask ^ binary_erosion(original_ink_mask, iterations=1)) | (
-                original_paper_mask ^ binary_erosion(original_paper_mask, iterations=1)
-            )
-        else:
-            paper_mask = original_paper_mask
-            ink_mask = original_ink_mask
-            border_mask = np.zeros_like(original_ink_mask, dtype=bool)
-
-        self.masks["paper"] = np.asarray(paper_mask, dtype=bool)
-        self.masks["ink"] = np.asarray(ink_mask, dtype=bool)
-        self.mask_border = np.asarray(border_mask, dtype=bool)
-        self.masks_exists["paper"] = True
-        self.masks_exists["ink"] = True
-        return paper_mask, ink_mask, border_mask
-
-
 class MainWindow(QMainWindow):
     """The main window containing the five-step analysis workflow."""
 
@@ -388,6 +248,7 @@ class MainWindow(QMainWindow):
         # before they are opened in this app.
         self.images = {key: image_data_colour(key) for key in ["B1", "B2", "A"]}
         self.mask_reference_colours = {key: self.images[key].reference_colours for key in ["B1", "B2", "A"]}
+        self.analysis_options = analysis_options()
         self.current_alignment_view = "B1"
         self.alignment_display_mode = "original"
         self.mask_overlay_colour = QColor("blue")
@@ -480,11 +341,23 @@ class MainWindow(QMainWindow):
         painter.end()
         label.setPixmap(fit_pixmap)
 
+    def _as_bool_mask(self, mask):
+        """Convert 2D or 3-channel mask arrays to a 2D bool mask for UI logic."""
+        if mask is None:
+            return None
+        array = np.asarray(mask, dtype=np.float32)
+        if array.ndim == 3:
+            if array.shape[-1] == 1:
+                array = array[..., 0]
+            else:
+                array = array[..., 0]
+        return array.astype(bool)
+
     def _display_mask_preview(self, label: QLabel, mask_array=None, border_mask=None, paper_mask=None, ink_mask=None):
         """Render the classification as white paper, black ink, and red for pixels in neither mask."""
         if paper_mask is not None and ink_mask is not None:
-            paper = np.asarray(paper_mask, dtype=bool)
-            ink = np.asarray(ink_mask, dtype=bool)
+            paper = self._as_bool_mask(paper_mask)
+            ink = self._as_bool_mask(ink_mask)
             h, w = paper.shape
             rendered = np.zeros((h, w, 3), dtype=np.uint8)
             rendered[paper] = [255, 255, 255]
@@ -496,9 +369,11 @@ class MainWindow(QMainWindow):
                 label.setPixmap(QPixmap())
                 return
 
-            mask = np.asarray(mask_array, dtype=bool)
+            mask = self._as_bool_mask(mask_array)
             if border_mask is None:
                 border_mask = mask ^ binary_erosion(mask, iterations=1)
+            else:
+                border_mask = self._as_bool_mask(border_mask)
 
             h, w = mask.shape
             rendered = np.zeros((h, w, 3), dtype=np.uint8)
@@ -666,7 +541,7 @@ class MainWindow(QMainWindow):
         self.load_preview_labels = {}
         self.path_labels = {}
         self.image_details_labels = {}
-        self.image_key_labels = {"B1": "Before image 1", "B2": "Before image2", "A": "After image"}
+        self.image_key_labels = {"B1": "Before Image 1", "B2": "Before Image 2", "A": "After Image"}
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(10)
@@ -722,8 +597,8 @@ class MainWindow(QMainWindow):
             if image_data.pixels.get("rgb") is None:
                 return None, None
 
-            paper_mask = image_data.masks.get("paper")
-            ink_mask = image_data.masks.get("ink")
+            paper_mask = self._as_bool_mask(image_data.masks.get("paper"))
+            ink_mask = self._as_bool_mask(image_data.masks.get("ink"))
             array = np.asarray(image_data.get_pixels("rgb"))
             h, w = array.shape[:2]
 
@@ -761,10 +636,15 @@ class MainWindow(QMainWindow):
 
         if self.alignment_checkbox.isChecked():
             paper_mask, ink_mask = self._get_intersection_masks_for_alignment()
+            self.analysis_options.int_paper_mask = paper_mask
+            self.analysis_options.int_ink_mask = ink_mask
             if paper_mask is None or ink_mask is None:
                 self._preview_from_array(self.alignment_preview, image)
                 return
         else:
+            self.analysis_options.int_paper_mask = None
+            self.analysis_options.int_ink_mask = None
+            self.analysis_options.intersection_mask = False
             paper_mask = image_data.masks.get("paper")
             ink_mask = image_data.masks.get("ink")
             if paper_mask is None or ink_mask is None:
@@ -786,8 +666,8 @@ class MainWindow(QMainWindow):
             array = np.repeat(array, 3, axis=-1)
         array = np.clip(array, 0.0, 1.0)
 
-        paper_bool = np.asarray(paper_mask, dtype=bool)
-        ink_bool = np.asarray(ink_mask, dtype=bool)
+        paper_bool = self._as_bool_mask(paper_mask)
+        ink_bool = self._as_bool_mask(ink_mask)
         overlay = np.array(self.mask_overlay_colour.getRgb()[:3], dtype=np.float32) / 255.0
         displayed = array.copy()
 
@@ -854,7 +734,14 @@ class MainWindow(QMainWindow):
         self.alignment_checkbox = QCheckBox("Aligned image mode")
         self.alignment_checkbox.setChecked(False)
         self.alignment_checkbox.setEnabled(False)
-        self.alignment_checkbox.toggled.connect(lambda checked: self._display_alignment_image())
+        self.analysis_options.images_aligned = self.alignment_checkbox.isChecked()
+        self.alignment_checkbox.toggled.connect(
+            lambda checked: (
+                self.analysis_options.sync_from_ui(images_aligned=checked),
+                self._refresh_analysis_options_state(),
+                self._display_alignment_image(),
+            )
+        )
         layout.addWidget(self.alignment_checkbox)
 
         view_group = QGroupBox("Alignment view")
@@ -1286,36 +1173,137 @@ class MainWindow(QMainWindow):
         self._set_mask_mode("luminance")
         return page
 
+    def _refresh_analysis_options_state(self):
+        """Keep the analysis option controls and their enabled states in sync with the stored settings."""
+        if not hasattr(self, "analysis_options"):
+            return
+
+        options = self.analysis_options
+        widgets = [
+            ("rgb_comparison_checkbox", options.rgb_comparison),
+            ("lab_comparison_checkbox", options.lab_comparison),
+            ("use_masks_checkbox", options.use_masks),
+            ("intersection_mask_checkbox", options.intersection_mask),
+            ("mean_comparison_checkbox", options.mean_comparison),
+            ("per_pixel_comparison_checkbox", options.per_pixel_comparison),
+        ]
+        for attr, value in widgets:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                widget.blockSignals(True)
+                widget.setChecked(value)
+                widget.blockSignals(False)
+
+        if hasattr(self, "heatmap_grid_slider"):
+            slider = self.heatmap_grid_slider
+            slider.blockSignals(True)
+            slider.setValue(options.heatmap_grid_size)
+            slider.blockSignals(False)
+
+        intersection_enabled = options.use_masks and options.images_aligned
+        per_pixel_enabled = not (options.use_masks and not options.intersection_mask)
+        heatmap_enabled = options.per_pixel_comparison and per_pixel_enabled
+
+        if hasattr(self, "intersection_mask_checkbox"):
+            if not intersection_enabled:
+                self.analysis_options.intersection_mask = False
+                self.intersection_mask_checkbox.blockSignals(True)
+                self.intersection_mask_checkbox.setChecked(False)
+                self.intersection_mask_checkbox.blockSignals(False)
+            self.intersection_mask_checkbox.setEnabled(intersection_enabled)
+
+        if hasattr(self, "per_pixel_comparison_checkbox"):
+            if not per_pixel_enabled:
+                self.analysis_options.per_pixel_comparison = False
+                self.per_pixel_comparison_checkbox.blockSignals(True)
+                self.per_pixel_comparison_checkbox.setChecked(False)
+                self.per_pixel_comparison_checkbox.blockSignals(False)
+            self.per_pixel_comparison_checkbox.setEnabled(per_pixel_enabled)
+
+        if hasattr(self, "heatmap_grid_slider"):
+            if not heatmap_enabled:
+                self.heatmap_grid_slider.setEnabled(False)
+            else:
+                self.heatmap_grid_slider.setEnabled(True)
+
     def _create_analysis_options_tab(self):
-        """Tab 4: future analysis settings kept deliberately blank and simple."""
+        """Tab 4: collect comparison and masking settings for later analysis."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
 
-        placeholder_group = QGroupBox("Future controls")
-        placeholder_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        placeholder_group.setMaximumHeight(220)
-        placeholder_layout = QVBoxLayout(placeholder_group)
+        options_group = QGroupBox("Comparison settings")
+        options_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        options_layout = QVBoxLayout(options_group)
 
-        self.future_checkbox_1 = QCheckBox("Use smoothing")
-        self.future_checkbox_2 = QCheckBox("Include edge check")
-        placeholder_layout.addWidget(self.future_checkbox_1)
-        placeholder_layout.addWidget(self.future_checkbox_2)
+        self.rgb_comparison_checkbox = QCheckBox("RGB comparison")
+        self.rgb_comparison_checkbox.setChecked(self.analysis_options.rgb_comparison)
+        self.rgb_comparison_checkbox.toggled.connect(
+            lambda checked: self.analysis_options.sync_from_ui(rgb_comparison=checked)
+        )
+        options_layout.addWidget(self.rgb_comparison_checkbox)
 
-        slider_1 = QSlider(Qt.Horizontal)
-        slider_1.setRange(0, 100)
-        slider_1.setValue(25)
-        placeholder_layout.addWidget(QLabel("Sensitivity: 25"))
-        placeholder_layout.addWidget(slider_1)
+        self.lab_comparison_checkbox = QCheckBox("LAB comparison")
+        self.lab_comparison_checkbox.setChecked(self.analysis_options.lab_comparison)
+        self.lab_comparison_checkbox.toggled.connect(
+            lambda checked: self.analysis_options.sync_from_ui(lab_comparison=checked)
+        )
+        options_layout.addWidget(self.lab_comparison_checkbox)
 
-        slider_2 = QSlider(Qt.Horizontal)
-        slider_2.setRange(0, 100)
-        slider_2.setValue(50)
-        placeholder_layout.addWidget(QLabel("Paper bias: 50"))
-        placeholder_layout.addWidget(slider_2)
+        self.use_masks_checkbox = QCheckBox("Use masks")
+        self.use_masks_checkbox.setChecked(self.analysis_options.use_masks)
+        self.use_masks_checkbox.toggled.connect(
+            lambda checked: (
+                self.analysis_options.sync_from_ui(use_masks=checked),
+                self._refresh_analysis_options_state(),
+            )
+        )
+        options_layout.addWidget(self.use_masks_checkbox)
 
-        layout.addWidget(placeholder_group)
+        self.intersection_mask_checkbox = QCheckBox("Intersection mask")
+        self.intersection_mask_checkbox.setChecked(self.analysis_options.intersection_mask)
+        self.intersection_mask_checkbox.toggled.connect(
+            lambda checked: (
+                self.analysis_options.sync_from_ui(intersection_mask=checked),
+                self._refresh_analysis_options_state(),
+            )
+        )
+        options_layout.addWidget(self.intersection_mask_checkbox)
+
+        self.mean_comparison_checkbox = QCheckBox("Mean comparison")
+        self.mean_comparison_checkbox.setChecked(self.analysis_options.mean_comparison)
+        self.mean_comparison_checkbox.toggled.connect(
+            lambda checked: self.analysis_options.sync_from_ui(mean_comparison=checked)
+        )
+        options_layout.addWidget(self.mean_comparison_checkbox)
+
+        self.per_pixel_comparison_checkbox = QCheckBox("Per-pixel comparison")
+        self.per_pixel_comparison_checkbox.setChecked(self.analysis_options.per_pixel_comparison)
+        self.per_pixel_comparison_checkbox.toggled.connect(
+            lambda checked: (
+                self.analysis_options.sync_from_ui(per_pixel_comparison=checked),
+                self._refresh_analysis_options_state(),
+            )
+        )
+        options_layout.addWidget(self.per_pixel_comparison_checkbox)
+
+        self.heatmap_grid_slider = QSlider(Qt.Horizontal)
+        self.heatmap_grid_slider.setRange(1, 100)
+        self.heatmap_grid_slider.setValue(self.analysis_options.heatmap_grid_size)
+        self.heatmap_grid_slider.valueChanged.connect(
+            lambda value: self.analysis_options.sync_from_ui(heatmap_grid_size=value)
+        )
+
+        heatmap_label = QLabel(f"Heatmap grid size: {self.analysis_options.heatmap_grid_size}px")
+        self.heatmap_grid_slider.valueChanged.connect(
+            lambda value: heatmap_label.setText(f"Heatmap grid size: {value}px")
+        )
+        options_layout.addWidget(heatmap_label)
+        options_layout.addWidget(self.heatmap_grid_slider)
+
+        layout.addWidget(options_group)
+        self._refresh_analysis_options_state()
         return page
 
     def _create_results_tab(self):
@@ -1346,50 +1334,39 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.report)
         return page
 
+    def dict_to_string(self,d, indent=4, _level=0):
+        """Convert a nested dict to an indented string.
+
+        Keys with dict values become headers ("key:") with their children
+        indented beneath them. Any other value is written inline ("key: value").
+        """
+        pad = " " * (indent * _level)
+        lines = []
+        for key, value in d.items():
+            if isinstance(value, dict):
+                lines.append(f"{pad}{key}:")
+                if value:  # skip empty dicts to avoid blank lines
+                    lines.append(self.dict_to_string(value, indent, _level + 1))
+            else:
+                lines.append(f"{pad}{key}: {value}")
+        return "\n".join(lines)
+
     def analyze_images(self):
         """Run the comparison for the three loaded images and report the result."""
+        
         if any(self.images[key].pixels.get("rgb") is None for key in ["B1", "B2", "A"]):
             QMessageBox.warning(self, "Missing input", "Load B1, B2, and A before running the analysis.")
             return
-
         try:
-            b1 = self.images["B1"].get_pixels("rgb")
-            b2 = self.images["B2"].get_pixels("rgb")
-            a = self.images["A"].get_pixels("rgb")
-            results = evaluate_reference_pair(b1, b2, a)
-            base = results["base"]
-            test = results["test"]
+            
+            results = compare_images(self.images["B1"], self.images["B2"], self.images["A"], self.analysis_options)
+            
+            summary_lines = self.dict_to_string(results,6)
 
-            summary_lines = [
-                "Base comparison: B1 vs B2",
-                f"Mean overall difference: {base['score']:.3f} ΔE00",
-                f"Paper verdict: {verdict_for_region(base['paper'])}",
-                f"Ink verdict: {verdict_for_region(base['ink'])}",
-                "",
-                describe_region_change(base["paper"], "paper"),
-                describe_region_change(base["ink"], "ink"),
-                "",
-                "Test comparison: B1 vs A",
-                f"Mean overall difference: {test['score']:.3f} ΔE00",
-                f"Paper verdict: {verdict_for_region(test['paper'])}",
-                f"Ink verdict: {verdict_for_region(test['ink'])}",
-                "",
-                describe_region_change(test["paper"], "paper"),
-                describe_region_change(test["ink"], "ink"),
-                "",
-                "Raw metric values:",
-            ]
-            for key, value in base["paper"].items():
-                summary_lines.append(f"- B2 paper {key}: {value:.3f}")
-            for key, value in base["ink"].items():
-                summary_lines.append(f"- B2 ink {key}: {value:.3f}")
-            for key, value in test["paper"].items():
-                summary_lines.append(f"- A paper {key}: {value:.3f}")
-            for key, value in test["ink"].items():
-                summary_lines.append(f"- A ink {key}: {value:.3f}")
-
-            self.report.setPlainText("\n".join(summary_lines))
+            self.report.setPlainText(summary_lines)
+            
             self.status_label.setText("Analysis complete. The report compares B1 against both B2 and A.")
+            
         except Exception as exc:
             QMessageBox.critical(self, "Analysis failed", f"Unable to analyze the images:\n{exc}")
 
