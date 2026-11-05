@@ -1334,22 +1334,25 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.report)
         return page
 
-    def dict_to_string(self,d, indent=4, _level=0):
+    def dict_to_string(self, d, indent=" "*4, section_break="", _level=0):
         """Convert a nested dict to an indented string.
 
         Keys with dict values become headers ("key:") with their children
         indented beneath them. Any other value is written inline ("key: value").
         """
-        pad = " " * (indent * _level)
-        lines = []
+        pad = indent * _level
+        blocks = []
         for key, value in d.items():
             if isinstance(value, dict):
-                lines.append(f"{pad}{key}:")
-                if value:  # skip empty dicts to avoid blank lines
-                    lines.append(self.dict_to_string(value, indent, _level + 1))
+                block = f"{pad}{key}:"
+                if value:
+                    block += "\n" + self.dict_to_string(value, indent, section_break, _level + 1)
             else:
-                lines.append(f"{pad}{key}: {value}")
-        return "\n".join(lines)
+                block = f"{pad}{key}: {value}"
+            blocks.append(block)
+
+        separator = f"\n{section_break}\n" if _level == 0 else "\n"
+        return separator.join(blocks)
 
     def analyze_images(self):
         """Run the comparison for the three loaded images and report the result."""
@@ -1361,7 +1364,7 @@ class MainWindow(QMainWindow):
             
             results = compare_images(self.images["B1"], self.images["B2"], self.images["A"], self.analysis_options)
             
-            summary_lines = self.dict_to_string(results,6)
+            summary_lines = self.dict_to_string(results,indent=" "*6, section_break="\n"+("-" * 64)+"\n")
 
             self.report.setPlainText(summary_lines)
             

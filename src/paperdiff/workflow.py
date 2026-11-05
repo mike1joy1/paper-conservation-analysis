@@ -81,6 +81,21 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
     3. Summarise the change in the paper and ink regions.
     4. Return the raw numbers and a simple score for each comparison.
     """
+
+    # Output options
+    results = dict()
+
+    results["Analysis Options"] = {
+        "rgb_comparison": op.rgb_comparison,
+        "lab_comparison": op.lab_comparison,
+        "use_masks": op.use_masks,
+        "intersection_mask": op.intersection_mask,
+        "images_aligned": op.images_aligned,
+        "mean_comparison": op.mean_comparison,
+        "per_pixel_comparison": op.per_pixel_comparison,
+        "heatmap_grid_size": op.heatmap_grid_size
+    }
+
     
     # Get masks
     individual_paper_mask = (not op.intersection_mask) or (op.int_paper_mask is None) or (not op.images_aligned)
@@ -112,7 +127,71 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
                 "a": op.int_ink_mask
         }
     
-    results = dict()
+    # mask test
+    total_pixels = {
+        "b1": np.prod(b1.pixels.get("rgb").shape[:2]),
+        "b2": np.prod(b2.pixels.get("rgb").shape[:2]),
+        "a": np.prod(a.pixels.get("rgb").shape[:2])
+    }
+    paper_pixels = {
+        "b1": np.sum(paper_mask["b1"])/3,
+        "b2": np.sum(paper_mask["b2"])/3,
+        "a": np.sum(paper_mask["a"])/3
+    }
+    ink_pixels = {
+        "b1": np.sum(ink_mask["b1"])/3,
+        "b2": np.sum(ink_mask["b2"])/3,
+        "a": np.sum(ink_mask["a"])/3
+    }
+    test_union_mask = {
+        "b1": np.maximum(paper_mask["b1"], ink_mask["b1"]),
+        "b2": np.maximum(paper_mask["b2"], ink_mask["b2"]),
+        "a": np.maximum(paper_mask["a"], ink_mask["a"])
+    }
+    test_intersection_mask = {
+        "b1": np.minimum(paper_mask["b1"], ink_mask["b1"]),
+        "b2": np.minimum(paper_mask["b2"], ink_mask["b2"]),
+        "a": np.minimum(paper_mask["a"], ink_mask["a"])
+    }
+
+    results["Image Data"] = {
+        "Before 1": {
+            "Resolution": str(b1.pixels.get("rgb").shape[0]) + "x" + str(b1.pixels.get("rgb").shape[1]),
+            "Total Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])),
+            "Paper Pixels": str(np.sum(paper_mask["b1"])/3),
+            "Paper Percentage": str((np.sum(paper_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
+            "Ink Pixels": str(np.sum(ink_mask["b1"])/3),
+            "Ink Percentage": str((np.sum(ink_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
+            "Unused Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3),
+            "Unused Percentage": str((np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
+            "Pixels in Both": str(np.sum(test_intersection_mask["b1"])/3),
+            "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0)
+        },
+        "Before 2": {
+            "Resolution": str(b2.pixels.get("rgb").shape[0]) + "x" + str(b2.pixels.get("rgb").shape[1]),
+            "Total Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])),
+            "Paper Pixels": str(np.sum(paper_mask["b2"])/3),
+            "Paper Percentage": str((np.sum(paper_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
+            "Ink Pixels": str(np.sum(ink_mask["b2"])/3),
+            "Ink Percentage": str((np.sum(ink_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
+            "Unused Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b2"])/3),
+            "Unused Percentage": str((np.prod(b2.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
+            "Pixels in Both": str(np.sum(test_intersection_mask["b2"])/3),
+            "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0)
+        },
+        "After": {
+            "Resolution": str(a.pixels.get("rgb").shape[0]) + "x" + str(a.pixels.get("rgb").shape[1]),
+            "Total Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])),
+            "Paper Pixels": str(np.sum(paper_mask["a"])/3),
+            "Paper Percentage": str((np.sum(paper_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
+            "Ink Pixels": str(np.sum(ink_mask["a"])/3),
+            "Ink Percentage": str((np.sum(ink_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
+            "Unused Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["a"])/3),
+            "Unused Percentage": str((np.prod(a.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
+            "Pixels in Both": str(np.sum(test_intersection_mask["a"])/3),
+            "Pixels in Both Percentage": str((np.sum(test_intersection_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0)
+        }
+    }
     
     # RGB comparisons
     if op.rgb_comparison:
